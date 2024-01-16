@@ -7,15 +7,20 @@ import requests
 import json
 import logging
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 
 from tqdm import tqdm
 
 log_file = "danbooru.log"
 
+last_committed = time.time()
 
-
+def wait_until_commit():
+    global last_committed
+    while time.time() - last_committed < 0.1:
+        time.sleep(0.01)
+    last_committed = time.time()
 
 class CachedRequest:
     """
@@ -36,7 +41,8 @@ class CachedRequest:
                         data = json.loads(line)
                         self.cache[data["url"]] = data["response"]
                     except Exception as e:
-                        logging.exception("Error loading cache: {}, skipping line".format(e))
+                        continue
+                        #logging.error("Error loading cache: {}, skipping line".format(e))
     def get(self, url):
         if url in self.cache:
             return self.cache[url]
@@ -48,6 +54,7 @@ class CachedRequest:
                     r = requests.get(url) # no proxy
                 r = requests.get(url, proxies={"http": handler, "https": handler}, timeout=10)
             else:
+                wait_until_commit()
                 r = requests.get(url)
             # if not 200, remove proxy first
             #if r.status_code != 200:
@@ -153,7 +160,8 @@ class DifferenceCache:
                         data = json.loads(line)
                         self.cache[data["id"]] = data["difference"]
                     except Exception as e:
-                        logging.exception("Error loading cache: {}, skipping line".format(e))
+                        continue
+                        #logging.exception("Error loading cache: {}, skipping line".format(e))
     def get(self, post_id):
         # if tuple, unpack
         if isinstance(post_id, tuple):
@@ -189,7 +197,8 @@ class PostPatchStateCache:
                         data = json.loads(line)
                         self.cache[data["id"]] = data["state"]
                     except Exception as e:
-                        logging.exception("Error loading cache: {}, skipping line".format(e))
+                        continue
+                        #logging.exception("Error loading cache: {}, skipping line".format(e))
     def get(self, post_id):
         return post_id in self.cache
     
@@ -217,7 +226,8 @@ class TagCreationCache:
                         data = json.loads(line)
                         self.cache[data["id"]] = {"tag_name": data["tag_id"], "tag_context": data["tag_name"]}
                     except Exception as e:
-                        logging.exception("Error loading cache: {}, skipping line".format(e))
+                        continue
+                        #logging.exception("Error loading cache: {}, skipping line".format(e))
     def init_tags(self):
         """
         Initialize tags
@@ -394,14 +404,14 @@ def threaded_executor():
                 pbar.update(1)
         except Empty:
             if event.is_set():
-                logging.info("Thread exiting")
+                logging.info("Thread exiting, event set")
                 break
             else:
                 logging.debug("Thread sleeping")
                 continue
         except Exception as e:
             if isinstance(e, KeyboardInterrupt):
-                logging.info("Thread exiting")
+                logging.info("Thread exiting, keyboard interrupt")
                 break
             logging.exception("Error in thread: {}".format(e))
             continue
@@ -420,6 +430,7 @@ def refresh_thread_and_event():
     event.clear()
     thread = threading.Thread(target=threaded_executor)
     thread.start()
+    logging.info("Thread refreshed")
 
 rate_limit_event = threading.Event()
 previous_time_sleeped = 2
@@ -427,10 +438,9 @@ def handle_rate_limit():
     """
     Handle rate limit
     """
-    global rate_limit_event
+    global rate_limit_event, previous_time_sleeped
     if not rate_limit_event.is_set():
         return
-    previous_time_sleeped *= 2
     logging.info(f"Rate limit reached, sleeping for {previous_time_sleeped} seconds")
     time.sleep(previous_time_sleeped)
     rate_limit_event.clear()
@@ -519,6 +529,7 @@ def patch_differences_auto_multi(ids, threads=4, submit=True, retry_count=5, tot
     """
     refresh_thread_and_event()
     print(f"Starting {threads} threads")
+    futures = []
     with ThreadPoolExecutor(max_workers=threads) as executor:
         global pbar
         pbar = tqdm(total=len(ids) if total is None else total)
@@ -528,15 +539,18 @@ def patch_differences_auto_multi(ids, threads=4, submit=True, retry_count=5, tot
                 id = id[0]
             if patched_posts.get(id):
                 logging.debug(f"Post {id} already patched, skipping")
-                pbar.update(1)
+                pbar.total -= 1
+                pbar.update(0)
                 continue
             elif not submit and difference_database.contains(id):
                 logging.debug(f"Post {id} already cached, skipping")
-                pbar.update(1)
+                pbar.total -= 1
+                pbar.update(0)
                 continue
-            executor.submit(partial(patch_differences_auto, id, submit=submit, retry_count=retry_count))
-        event.set()
-
+            future = executor.submit(partial(patch_differences_auto, id, submit=submit, retry_count=retry_count))
+            futures.append(future)
+    logging.info("All posts submitted")
+    return futures
 import argparse
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Sanity check for danbooru database')
@@ -572,7 +586,19 @@ if __name__ == "__main__":
             all_post_ids = all_post_ids.where(Post.id <= args.end_idx)
         all_post_ids = all_post_ids.tuples()
     print(f"Found {len(all_post_ids)} posts")
-    patch_differences_auto_multi(all_post_ids, threads=args.threads, submit=args.submit, retry_count=args.retry, total=len(all_post_ids))
+    futures = patch_differences_auto_multi(all_post_ids, threads=args.threads, submit=args.submit, retry_count=args.retry, total=len(all_post_ids))
+    logging.info("All posts submitted, waiting for futures")
+    for future in as_completed(futures):
+        try:
+            future.result()
+        except Exception as e:
+            if isinstance(e, KeyboardInterrupt):
+                logging.info("Exiting...")
+                event.set()
+                break
+            else:
+                logging.exception("Error in future: {}".format(e))
+                continue
     logging.info("All posts checked")
     logging.info("Exiting...")
     # set event to stop thread

@@ -18,7 +18,7 @@ last_committed = time.time()
 
 def wait_until_commit():
     global last_committed
-    while time.time() - last_committed < 0.1:
+    while time.time() - last_committed < 0.09:
         time.sleep(0.01)
     last_committed = time.time()
 
@@ -547,6 +547,22 @@ def patch_differences_auto_multi(ids, threads=4, submit=True, retry_count=5, tot
                 pbar.total -= 1
                 pbar.update(0)
                 continue
+            # if futures are too many, wait
+            while len(futures) > 1000:
+                for future in as_completed(futures):
+                    if len(futures) < 100:
+                        break
+                    try:
+                        future.result()
+                        futures.remove(future)
+                    except Exception as e:
+                        if isinstance(e, KeyboardInterrupt):
+                            logging.info("Exiting...")
+                            event.set()
+                            break
+                        else:
+                            logging.exception("Error in future: {}".format(e))
+                            continue
             future = executor.submit(partial(patch_differences_auto, id, submit=submit, retry_count=retry_count))
             futures.append(future)
     logging.info("All posts submitted")

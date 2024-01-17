@@ -14,13 +14,16 @@ from tqdm import tqdm
 
 log_file = "danbooru.log"
 
-last_committed = time.time()
 
-def wait_until_commit():
-    global last_committed
-    while time.time() - last_committed < 0.09:
+proxies_last_commmited = {}
+def wait_until_commit(proxy=None):
+    """
+    Wait until the proxy is idle (avoids rate limiting)
+    """
+    global proxies_last_commmited
+    while time.time() - proxies_last_commmited.get(proxy, 0) < 0.1:
         time.sleep(0.01)
-    last_committed = time.time()
+    proxies_last_commmited[proxy] = time.time()
 
 class CachedRequest:
     """
@@ -44,25 +47,28 @@ class CachedRequest:
                         continue
                         #logging.error("Error loading cache: {}, skipping line".format(e))
     def get(self, url):
+        logging.debug(f"Getting response for url {url}")
         if url in self.cache:
+            logging.debug(f"Found cached response for url {url}")
             return self.cache[url]
         else:
             if self.proxy_handler is not None:
-                handler = self.proxy_handler.get()
+                logging.debug(f"Using proxy {self.proxy_handler}")
+                handler = self.proxy_handler
                 #print("Using proxy {}".format(handler))
                 if handler is None:
                     r = requests.get(url) # no proxy
-                r = requests.get(url, proxies={"http": handler, "https": handler}, timeout=10)
+                    r.raise_for_status()
+                    r = r.json()
+                else:
+                    logging.debug(f"Using proxy {handler}")
+                    r = handler.get(url)
             else:
                 wait_until_commit()
                 r = requests.get(url)
-            # if not 200, remove proxy first
-            #if r.status_code != 200:
-                #if self.proxy_handler is not None:
-                    #self.proxy_handler.remove(proxy=r.proxies["http"])
-                    #self.proxy_handler.refresh_proxies()
-            r.raise_for_status()
-            to_json = {"url": url, "response": r.json()}
+                r.raise_for_status()
+                r = r.json()
+            to_json = {"url": url, "response": r}
             # validate, check "id" key
             if "id" not in to_json["response"]:
                 raise ValueError("Invalid response: {}".format(to_json["response"]))
@@ -75,73 +81,37 @@ class ProxyHandler:
     """
     Wrapper for proxies
     """
-    def __init__(self, proxy_file_raw_addr = r""):
-        self.proxy_list_raw_addr = proxy_file_raw_addr
-        self.proxies = {}
-        self.failed_proxies = set()
-        self.chosen_index = 0
-        self.load_proxies()
-        self.last_refresh_time = time.time()
-        self.refresh_interval = 10800 # 3 hours
-    
-    def refresh_everything(self):
-        if time.time() - self.last_refresh_time > self.refresh_interval:
-            self.refresh_proxies()
-            self.last_refresh_time = time.time()
-
-    def load_proxies(self,proxy_type="http"):
-        r = requests.get(self.proxy_list_raw_addr.replace("*",proxy_type))
+    def __init__(self, proxies:List[str]=None, proxy_auth=None):
+        self.proxies = proxies
+        self.proxy_auth = proxy_auth
+        self.proxy_idx = 0
+    def get(self, url):
+        """
+        Get response from proxy
+        """
+        if self.proxies is None:
+            print("No proxies available")
+            raise ValueError("No proxies available")
+        if self.proxy_idx >= len(self.proxies):
+            self.proxy_idx = 0
+        proxy_addr = self.proxies[self.proxy_idx]
+        self.proxy_idx += 1
+        session = requests.Session()
+        if self.proxy_auth is not None:
+            session.auth = tuple(self.proxy_auth.split(":"))
+        if not proxy_addr.endswith("/"):
+            proxy_addr += "/"
+        proxy_addr = proxy_addr + "get_response"
+        print("Using proxy {}".format(proxy_addr))
+        wait_until_commit(proxy=proxy_addr)
+        r = session.get(proxy_addr, params={"url": url})
         r.raise_for_status()
-        self.proxies[proxy_type] = r.text.split("\n")
-        # count
-        for i in range(len(self.proxies[proxy_type])):
-            if self.proxies[proxy_type][i].count(":") > 1:
-                self.proxies[proxy_type][i] = self.proxies[proxy_type][i].rsplit(":",1)[0]
-        # remove failed proxies
-        self.proxies[proxy_type] = [proxy for proxy in self.proxies[proxy_type] if proxy not in self.failed_proxies]
-        print("Testing {} proxies".format(len(self.proxies[proxy_type])))
-        #self.test_proxy(proxy_type)
-        print("Tested {} proxies".format(len(self.proxies[proxy_type])))
-        logging.info("Loaded {} proxies".format(len(self.proxies[proxy_type])))
-    def refresh_proxies(self,proxy_type="http"):
-        self.load_proxies(proxy_type)
-    def get(self, proxy_type="http"):
-        self.refresh_everything()
-        if self.chosen_index >= len(self.proxies[proxy_type]):
-            self.chosen_index = 0
-        proxy = self.proxies[proxy_type][self.chosen_index]
-        self.chosen_index += 1
-        return proxy
-    def remove(self, proxy_type="http", proxy=None):
-        self.proxies[proxy_type].remove(proxy)
-        #self.failed_proxies.add(proxy)
-    def test_proxy(self, proxy_type="http", threads=-1):
-        if threads == -1:
-            threads = len(self.proxies[proxy_type])
-            print("Using {} threads".format(threads))
-        futures = {}
-        proxy_pbar = tqdm(total=len(self.proxies[proxy_type]), desc="Testing proxies")
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            for proxy in self.proxies[proxy_type]:
-                future = executor.submit(self.test_proxy_single, proxy, pbar=proxy_pbar)
-                futures[future] = proxy
-        success_list = []
-        for future in futures:
-            if future.result():
-                success_list.append(futures[future])
-        # finally, replace proxies with success_list
-        self.proxies[proxy_type] = success_list
-    def test_proxy_single(self, proxy, pbar=None):
-        try:
-            r = requests.get("https://danbooru.donmai.us/posts/1.json", proxies={"http": proxy, "https": proxy}, timeout=10)
-            r.raise_for_status()
-        except Exception as e:
-            self.failed_proxies.add(proxy)
-            return False
-        finally:
-            if pbar is not None:
-                pbar.update(1)
-        return True
+        json_response = r.json()
+        if not json_response["success"]:
+            print("Proxy {} returned error: {}".format(proxy_addr, json_response["response"]))
+            raise ValueError("Invalid response: {}".format(json_response))
+        return json_response["response"]
+
 class DifferenceCache:
     """
     Wrapper for caching differences
@@ -164,6 +134,7 @@ class DifferenceCache:
                         #logging.exception("Error loading cache: {}, skipping line".format(e))
     def get(self, post_id):
         # if tuple, unpack
+        logging.debug(f"Getting difference for post {post_id}")
         if isinstance(post_id, tuple):
             assert len(post_id) == 1, "post_id tuple must be of length 1"
             post_id = post_id[0]
@@ -547,22 +518,6 @@ def patch_differences_auto_multi(ids, threads=4, submit=True, retry_count=5, tot
                 pbar.total -= 1
                 pbar.update(0)
                 continue
-            # if futures are too many, wait
-            while len(futures) > 1000:
-                for future in as_completed(futures):
-                    if len(futures) < 100:
-                        break
-                    try:
-                        future.result()
-                        futures.remove(future)
-                    except Exception as e:
-                        if isinstance(e, KeyboardInterrupt):
-                            logging.info("Exiting...")
-                            event.set()
-                            break
-                        else:
-                            logging.exception("Error in future: {}".format(e))
-                            continue
             future = executor.submit(partial(patch_differences_auto, id, submit=submit, retry_count=retry_count))
             futures.append(future)
     logging.info("All posts submitted")
@@ -578,10 +533,14 @@ if __name__ == "__main__":
     parser.add_argument('--end-idx', type=int, default=-1, help='End index for posts')
     parser.add_argument('--all', action="store_true", help='Check all posts')
     parser.add_argument('--proxy', action="store_true", help='Use proxy')
-    parser.add_argument('--proxy-address', type=str, default=r"", help='Proxy text file (raw) address')
+    parser.add_argument('--proxy-file', type=str, default=None, help='Filepath to proxy list')
+    parser.add_argument('--proxy-address', type=str, default=None, help='Proxy address')
+    parser.add_argument('--proxy-auth', type=str, default=r"", help='Proxy authentication (user:password)')
     parser.add_argument('--logging-file', type=str, default=log_file, help='Logging file')
     parser.add_argument('--save-file', type=str, default="difference_cache.jsonl", help='Difference cache file')
     parser.add_argument('--requests-cache', type=str, default="cache.jsonl", help='Requests cache file')
+    # --unordered
+    parser.add_argument('--unordered', action="store_true", help='Shuffle the posts')
     args = parser.parse_args()
     logging.basicConfig(filename=args.logging_file, level=logging.INFO)
     difference_database = DifferenceCache(args.save_file)
@@ -589,18 +548,27 @@ if __name__ == "__main__":
     print(f"Found finished transactions: {len(patched_posts.cache)}")
     print(f"Found cached differences: {len(difference_database.cache)}")
     if args.proxy:
-        proxyhandler = ProxyHandler(proxy_file_raw_addr=args.proxy_address)
+        if args.proxy_file is not None:
+            with open(args.proxy_file, "r", encoding="utf-8") as f:
+                proxies = [line.strip() for line in f]
+            proxyhandler = ProxyHandler(proxies=proxies, proxy_auth=args.proxy_auth)
+        elif args.proxy_address is not None:
+            proxyhandler = ProxyHandler(proxies=[args.proxy_address], proxy_auth=args.proxy_auth)
+        else:
+            raise ValueError("Must specify either --proxy-file or --proxy-address")
         # bind
         requests_cache.proxy_handler = proxyhandler
     # lazy iterator for peewee
     all_post_ids = []
     if args.all:
-        all_post_ids = Post.select(Post.id).tuples()
+        all_post_ids = Post.select(Post.id)
     else:
         all_post_ids = Post.select(Post.id).where(Post.id >= args.start_idx)
         if args.end_idx != -1:
             all_post_ids = all_post_ids.where(Post.id <= args.end_idx)
-        all_post_ids = all_post_ids.tuples()
+    if args.unordered:
+        all_post_ids = all_post_ids.order_by(fn.Random())
+    all_post_ids = all_post_ids.tuples()
     print(f"Found {len(all_post_ids)} posts")
     futures = patch_differences_auto_multi(all_post_ids, threads=args.threads, submit=args.submit, retry_count=args.retry, total=len(all_post_ids))
     logging.info("All posts submitted, waiting for futures")

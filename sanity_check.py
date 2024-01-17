@@ -13,7 +13,7 @@ from functools import partial
 from tqdm import tqdm
 
 log_file = "danbooru.log"
-
+PER_REQUEST_POSTS = 100
 
 proxies_last_commmited = {}
 def wait_until_commit(proxy=None):
@@ -70,7 +70,7 @@ class CachedRequest:
                 r = r.json()
             to_json = {"url": url, "response": r}
             # validate, check "id" key
-            if "id" not in to_json["response"]:
+            if "id" not in str(to_json["response"]):
                 raise ValueError("Invalid response: {}".format(to_json["response"]))
             self.cache[url] = to_json["response"]
             with open(self.cache_file, "a") as f:
@@ -268,29 +268,52 @@ def get_id_from_tag(tag:Union[Tag,List[Tag]]):
         return [get_id_from_tag(t) for t in tag]
     else:
         raise TypeError(f"tag must be Tag or List[Tag] but got {type(tag)}")
-
+def get_query_bulk(index):
+    """
+    Returns the query link that contains the index
+    """
+    start_idx = index - index % PER_REQUEST_POSTS
+    end_idx = start_idx + PER_REQUEST_POSTS - 1
+    # no page
+    query = f"https://danbooru.donmai.us/posts.json?tags=id%3A{start_idx}..{end_idx}&limit={PER_REQUEST_POSTS}"
+    return query
 
 def check_danbooru_post(post_id,by_id=False):
-    url = "https://danbooru.donmai.us/posts/{}.json".format(post_id)
-    r = requests_cache.get(url)
-    result_dict = {
-        "id" : r["id"],
-        "file_url" : r["large_file_url"] if "large_file_url" in r else r.get("file_url",None), # use large_file_url if available (for high res images)
-        "rating" : rating_dict[r["rating"]],
-        "year" : r["created_at"][0:4],
-        "score" : r["score"],
-        "fav_count" : r["fav_count"],
-        "tag_list_general" : r["tag_string_general"].split(" "),
-        "tag_list_character" : r["tag_string_character"].split(" "),
-        "tag_list_artist" : r["tag_string_artist"].split(" "),
-        "tag_list_meta" : r["tag_string_meta"].split(" "),
-        "tag_list_copyright" : r["tag_string_copyright"].split(" "),
-    }
-    if by_id:
-        for key in result_dict:
-            if "tag_list" not in key:
-                continue
-            result_dict[key] = convert_string_to_tag_ids(result_dict[key],key.split("_")[2])
+    try:
+        url = get_query_bulk(post_id)
+        #print(f"Getting response from url {url} for post {post_id}")
+        r = requests_cache.get(url)
+        # check if post exists
+        if len(r) == 0:
+            logging.warning(f"Post {post_id} does not exist")
+            return None
+        #print(f"Found {len(r)} posts")
+        r_post = [post for post in r if post["id"] == post_id]
+        if len(r_post) == 0:
+            logging.error(f"Post {post_id} does not exist in response {r}")
+            return None
+        r = r_post[0]
+        result_dict = {
+            "id" : r["id"],
+            "file_url" : r["large_file_url"] if "large_file_url" in r else r.get("file_url",None), # use large_file_url if available (for high res images)
+            "rating" : rating_dict[r["rating"]],
+            "year" : r["created_at"][0:4],
+            "score" : r["score"],
+            "fav_count" : r["fav_count"],
+            "tag_list_general" : r["tag_string_general"].split(" "),
+            "tag_list_character" : r["tag_string_character"].split(" "),
+            "tag_list_artist" : r["tag_string_artist"].split(" "),
+            "tag_list_meta" : r["tag_string_meta"].split(" "),
+            "tag_list_copyright" : r["tag_string_copyright"].split(" "),
+        }
+        if by_id:
+            for key in result_dict:
+                if "tag_list" not in key:
+                    continue
+                result_dict[key] = convert_string_to_tag_ids(result_dict[key],key.split("_")[2])
+    except Exception as e:
+        print(f"Exception: {e}")
+        logging.exception(f"Error in post {post_id}: {e}")
     return result_dict
 
 def check_database_post(post_id,by_id=True):
@@ -478,7 +501,8 @@ def patch_differences_auto(id, submit=True, retry_count=100):
             # check 429 error
             if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
                 rate_limit_event.set()
-            #logging.exception(f"Error in post {id}: {e}")
+            else:
+                logging.exception(f"Error in post {id}: {e}")
             continue
     global pbar
     if pbar is not None:

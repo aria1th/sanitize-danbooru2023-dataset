@@ -102,7 +102,7 @@ class ProxyHandler:
         if not proxy_addr.endswith("/"):
             proxy_addr += "/"
         proxy_addr = proxy_addr + "get_response"
-        print("Using proxy {}".format(proxy_addr))
+        #print("Using proxy {}".format(proxy_addr))
         wait_until_commit(proxy=proxy_addr)
         r = session.get(proxy_addr, params={"url": url})
         r.raise_for_status()
@@ -110,6 +110,8 @@ class ProxyHandler:
         if not json_response["success"]:
             print("Proxy {} returned error: {}".format(proxy_addr, json_response["response"]))
             raise ValueError("Invalid response: {}".format(json_response))
+        if isinstance(json_response["response"], str):
+            json_response["response"] = json.loads(json_response["response"])
         return json_response["response"]
 
 class DifferenceCache:

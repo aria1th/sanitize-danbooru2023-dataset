@@ -511,12 +511,12 @@ def patch_differences_auto(id, submit=True, retry_count=100):
         logging.warning(f"Post {id} does not exist, patch failed")
         return
     elif len(difference_dict[0]) == 0:
-        logging.info(f"Post {id} is up to date")
+        logging.debug(f"Post {id} is up to date")
         return
     if submit:
         patch_differences(id, difference_dict[1], difference_dict[0], submit=submit)
     else:
-        logging.info(f"Post {id} had differences, but not submitted")
+        logging.debug(f"Post {id} had differences, but not submitted")
 
 
 

@@ -594,3 +594,4 @@ if __name__ == "__main__":
     logging.info("Exiting...")
     if pbar is not None:
         pbar.close()
+    input("Press enter to exit")

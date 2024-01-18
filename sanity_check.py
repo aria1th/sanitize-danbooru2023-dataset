@@ -25,6 +25,38 @@ def wait_until_commit(proxy=None):
         time.sleep(0.01)
     proxies_last_commmited[proxy] = time.time()
 
+
+def generate_retry_handler(retry_count=5):
+    def get_request_locally(url):
+        for _ in range(retry_count):
+            try:
+                wait_until_commit()
+                result = requests.get(url)
+                result.raise_for_status()
+                return result
+            except Exception as e:
+                logging.error("Error in request: {}, retrying".format(e))
+                continue
+        raise ValueError("Request failed")
+    return get_request_locally
+
+def generate_session_retry_handler(retry_count=5):
+    def get_request_locally(session, url,params, proxy):
+        for _ in range(retry_count):
+            try:
+                wait_until_commit(proxy=proxy)
+                result = session.get(url,params=params)
+                result.raise_for_status()
+                return result
+            except Exception as e:
+                logging.error("Error in request: {}, retrying".format(e))
+                continue
+        raise ValueError("Request failed")
+    return get_request_locally
+
+request_getter = None
+session_getter = None
+
 class CachedRequest:
     """
     Wrapper for requests to cache get method
@@ -47,6 +79,7 @@ class CachedRequest:
                         continue
                         #logging.error("Error loading cache: {}, skipping line".format(e))
     def get(self, url):
+        global request_getter
         logging.debug(f"Getting response for url {url}")
         if url in self.cache:
             logging.debug(f"Found cached response for url {url}")
@@ -57,15 +90,14 @@ class CachedRequest:
                 handler = self.proxy_handler
                 #print("Using proxy {}".format(handler))
                 if handler is None:
-                    r = requests.get(url) # no proxy
+                    r = request_getter(url) # no proxy
                     r.raise_for_status()
                     r = r.json()
                 else:
                     logging.debug(f"Using proxy {handler}")
                     r = handler.get(url)
             else:
-                wait_until_commit()
-                r = requests.get(url)
+                r = request_getter(url)
                 r.raise_for_status()
                 r = r.json()
             to_json = {"url": url, "response": r}
@@ -77,6 +109,7 @@ class CachedRequest:
                 f.write(json.dumps(to_json) + "\n")
             return to_json["response"]
 
+
 class ProxyHandler:
     """
     Wrapper for proxies
@@ -86,6 +119,7 @@ class ProxyHandler:
         self.proxy_auth = proxy_auth
         self.proxy_idx = 0
     def get(self, url):
+        global session_getter
         """
         Get response from proxy
         """
@@ -104,7 +138,7 @@ class ProxyHandler:
         proxy_addr = proxy_addr + "get_response"
         #print("Using proxy {}".format(proxy_addr))
         wait_until_commit(proxy=proxy_addr)
-        r = session.get(proxy_addr, params={"url": url})
+        r = session_getter(session, proxy_addr, params={"url": url}, proxy=proxy_addr)
         r.raise_for_status()
         json_response = r.json()
         if not json_response["success"]:
@@ -113,6 +147,7 @@ class ProxyHandler:
         if isinstance(json_response["response"], str):
             json_response["response"] = json.loads(json_response["response"])
         return json_response["response"]
+
 
 class DifferenceCache:
     """
@@ -569,6 +604,8 @@ if __name__ == "__main__":
     parser.add_argument('--unordered', action="store_true", help='Shuffle the posts')
     args = parser.parse_args()
     logging.basicConfig(filename=args.logging_file, level=logging.INFO)
+    request_getter = generate_retry_handler(args.retry)
+    session_getter = generate_session_retry_handler(args.retry)
     difference_database = DifferenceCache(args.save_file)
     requests_cache = CachedRequest(args.requests_cache)
     print(f"Found finished transactions: {len(patched_posts.cache)}")

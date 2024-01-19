@@ -327,6 +327,8 @@ def check_danbooru_post(post_id,by_id=False):
         if len(r_post) == 0:
             logging.error(f"Post {post_id} does not exist in response {r}")
             return None
+        if len(r_post) < PER_REQUEST_POSTS:
+            logging.warning(f"Post {post_id} has less than {PER_REQUEST_POSTS} posts in response")
         r = r_post[0]
         result_dict = {
             "id" : r["id"],
